@@ -16,6 +16,8 @@ import gc
 import pandas as pd
 import numpy as np
 
+import torch
+
 #from contrastive import CPCA
 import mnnpy
 
@@ -31,6 +33,8 @@ class Celligner(object):
         umap_kwargs=UMAP_PARAMS,
         mnn_method="mnn_marioni",
         low_mem=False,
+        device="cpu",
+        alpha=1.0,
     ):
         """
         Initialize Celligner object
@@ -71,6 +75,9 @@ class Celligner(object):
         self.umap_reduced = None
         self.output_clusters = None
         self.tumor_CL_dist = None
+
+        self.device = device
+        self.alpha = alpha
 
 
     def __checkExpression(self, expression, is_reference):
@@ -193,15 +200,27 @@ class Celligner(object):
             (ndarray, ncomponents,): variance explained by each component
 
         """
-        target_cov = centered_target_input.cov()
-        ref_cov = centered_ref_input.cov()
-        if not self.low_mem:
-            pca = PCA(self.cpca_ncomp, svd_solver="randomized", copy=False)
-        else: 
-            pca = IncrementalPCA(self.cpca_ncomp, copy=False, batch_size=1000)
+        target_cov = centered_target_input.cov().values
+        ref_cov = centered_ref_input.cov().values
         
-        pca.fit(target_cov - ref_cov)
-        return pca.components_, pca.explained_variance_
+        # Step 1: Convert correlation matrix to torch tensor and compute eigenvalues and eigenvectors
+        diff_cov = torch.tensor(target_cov - self.alpha * ref_cov,dtype=torch.float32,device=self.device)
+        eigenvalues, eigenvectors = torch.linalg.eigh(diff_cov)
+        
+        # Step 2: Sort the eigenvalues and eigenvectors in descending order
+        sorted_indices = torch.argsort(eigenvalues, descending=True)
+        sorted_eigenvalues = eigenvalues[sorted_indices]
+        sorted_eigenvectors = eigenvectors[:, sorted_indices]
+    
+        # Step 3: Select the top n_components if specified
+        if self.cpca_ncomp is not None:
+            sorted_eigenvalues = sorted_eigenvalues[:self.cpca_ncomp]
+            sorted_eigenvectors = sorted_eigenvectors[:, :self.cpca_ncomp]
+        
+        # Step 4: Compute the explained variance
+        explained_variance = sorted_eigenvalues / torch.sum(sorted_eigenvalues)
+        
+        return sorted_eigenvectors.cpu().numpy(), explained_variance.cpu().numpy()
 
 
     def fit(self, ref_expr):
