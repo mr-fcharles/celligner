@@ -19,7 +19,6 @@ import numpy as np
 
 import torch
 
-#from contrastive import CPCA
 import mnnpy
 
 
@@ -176,27 +175,18 @@ class Celligner(object):
         data = expression.T
         data = data[data.columns[clusters != -1].tolist()]
 
+        #running differential expression
         de = FComputer(n_jobs=8)
-        #de.fit(data.values, design_matrix.values.astype(float),gene_names=data.index)
         de.fit_sklearn(data.values, design_matrix.values.astype(float),gene_names=data.index)
         de.eBayes()
         de.Fstats()
 
+        #formatting output
         res = pd.DataFrame()
         res['F'] = de.F
         res['index'] = data.index
-        #set index
         res.set_index('index', inplace=True)
         
-        # running limmapy
-        print("Running limmapy..")
-        #res = (
-        #    limma.limmapy()
-        #    .lmFit(data, design_matrix)
-        #    .eBayes(trend=False)
-        #    .topTable(number=len(data)) 
-        #    .iloc[:, len(clusts) :]
-        #)
         return res.sort_values(by="F", ascending=False)
     
 
@@ -263,6 +253,39 @@ class Celligner(object):
         self.ref_de_genes = self.__runDiffExprOnClusters(self.ref_input, self.ref_clusters,n_jobs=n_jobs)
 
         return self
+    
+    def __regress_out_cpcs(self, input_data, pcs, loadings, regression_method):
+        """
+        Regress out the cPCs from the input data.
+
+        Args:
+            input_data (pd.DataFrame): The input data to transform.
+            pcs (pd.DataFrame): The principal components.
+            loadings (np.ndarray): The cPCA loadings.
+            regression_method (str): The regression method to use ('by_sample', 'by_cPC', or 'back_project').
+
+        Returns:
+            pd.DataFrame: The transformed data with cPCs regressed out.
+        """
+        if regression_method == "by_sample":
+            input_data = input_data.sort_index()
+            pcs = pcs.sort_index()
+            return input_data - LinearRegression(fit_intercept=False).fit(pcs, input_data).predict(pcs).T
+
+        elif regression_method == "by_cPC":
+            return (input_data.T - LinearRegression(fit_intercept=False)
+                    .fit(loadings, input_data.T)
+                    .predict(loadings)).T
+
+        elif regression_method == "back_project":
+            return pd.DataFrame(
+                input_data.values - (input_data.values @ loadings @ loadings.T),
+                index=input_data.index,
+                columns=input_data.columns
+            )
+
+        else:
+            raise ValueError("Invalid regression method")
 
 
     def transform(self, target_expr=None, compute_cPCs=True,regression_method="back_project"):
@@ -304,6 +327,7 @@ class Celligner(object):
 
                 # Cluster and find differential expression for target data
                 self.target_clusters = self.__cluster(self.target_input)
+
                 if len(set(self.target_clusters)) < 2:
                     raise ValueError("Only one cluster found in reference data, no differential expression possible")
                 self.target_de_genes = self.__runDiffExprOnClusters(self.target_input, self.target_clusters)
@@ -338,94 +362,21 @@ class Celligner(object):
             gc.collect()
 
             print("Regressing top cPCs out of reference dataset..")
+            transformed_ref = self.__regress_out_cpcs(self.ref_input, self.ref_pcs, self.cpca_loadings, regression_method)
+
+            print("Regressing top cPCs out of target dataset..")
+            transformed_target = self.__regress_out_cpcs(self.target_input, self.target_pcs, self.cpca_loadings, regression_method)
             
-            if regression_method == "by_sample":
-                #sort self.ref_input by index
-                self.ref_input = self.ref_input.sort_index()
-                #sort self.target_pcs by index
-                self.ref_pcs = self.ref_pcs.sort_index()
-                # Take the residuals of the linear regression of ref_input with the cpca_loadings
-                transformed_ref = (self.ref_input - 
-                LinearRegression(fit_intercept=False)
-                    .fit(self.ref_pcs, self.ref_input)
-                    .predict(self.ref_pcs)
-                    .T
-                )
-            elif regression_method == "by_cPC": #should be equivalent to the previous version
-                # Take the residuals of the linear regression of ref_input with the cpca_loadings
-                transformed_ref = (self.ref_input.T - 
-                LinearRegression(fit_intercept=False)
-                    .fit(self.cpca_loadings, self.ref_input.T)
-                    .predict(self.cpca_loadings)
-                    #.T
-                ).T
-
-            elif regression_method == "back_project":
-                transformed_ref = pd.DataFrame(self.ref_input.values - (self.ref_input.values @ self.cpca_loadings @ self.cpca_loadings.T), 
-                                               index=self.ref_input.index, 
-                                               columns=self.ref_input.columns)
-
-            else:
-                raise ValueError("Invalid regression method")
-
-
 
         # Using previously computed cPCs - for multi-dataset alignment
         else:
             
             # Allow some genes to be missing in new target dataset
-            missing_genes = list(self.ref_input.loc[:, ~self.ref_input.columns.isin(target_expr.columns)].columns)
-            if len(missing_genes) > 0:
-                print('WARNING: %d genes from reference dataset not found in new target dataset, subsetting to overlap' % (len(missing_genes)))
-                # Get index of dropped genes
-                drop_idx = [self.ref_input.columns.get_loc(g) for g in missing_genes]
-                
-                # Filter refence dataset
-                self.ref_input = self.ref_input.loc[:, self.ref_input.columns.isin(target_expr.columns)]
-                self.common_genes = list(self.ref_input.columns)
-
-                # Drop cPCA loadings for genes that were filtered out
-                self.cpca_loadings = np.array([np.delete(self.cpca_loadings[n], drop_idx) for n in range(self.cpca_ncomp)])
-                
-                # Check if genes need to be dropped from DE list
-                overlap = self.ref_input.loc[:, self.ref_input.columns.isin(self.de_genes)]
-                if overlap.shape[1] < len(self.de_genes):
-                    print('WARNING: dropped genes include %d differentially expressed genes that may be important' % (len(self.de_genes) - overlap.shape[1]))
-                    temp = pd.Series(self.de_genes)
-                    self.de_genes = temp[temp.isin(self.ref_input.columns)].to_list()
-
-            self.target_input = self.__checkExpression(target_expr, is_reference=False)
+            #TODO: implement a strategy to handle missing values
+            target_expr = self.__checkExpression(target_expr, is_reference=False)
+            transformed_target = self.__regress_out_cpcs(target_expr, self.target_pcs, self.cpca_loadings, regression_method)
             transformed_ref = self.ref_input
-        
-        # Only need to regress out of target dataset if using previously computed cPCs
-        print("Regressing top cPCs out of target dataset..")
-        if regression_method == "by_sample":
-            #sort self.target_input by index
-            self.target_input = self.target_input.sort_index()
-            #sort self.target_pcs by index
-            self.target_pcs = self.target_pcs.sort_index()
-            transformed_target = (self.target_input - 
-                LinearRegression(fit_intercept=False)
-                .fit(self.target_pcs, self.target_input)
-                .predict(self.target_pcs)
-                    .T
-                )
-            
-        elif regression_method == "by_cPC":
-            transformed_target = (self.target_input.T - 
-                LinearRegression(fit_intercept=False)
-                .fit(self.cpca_loadings, self.target_input.T)
-                .predict(self.cpca_loadings)
-                    #.T
-                ).T
-
-        elif regression_method == "back_project":
-            transformed_target = pd.DataFrame(self.target_input.values - (self.target_input.values @ self.cpca_loadings @ self.cpca_loadings.T), 
-                                               index=self.target_input.index, 
-                                               columns=self.target_input.columns)
-
-        else:
-            raise ValueError("Invalid regression method")
+       
 
         # Do MNN 
         print("Doing the MNN analysis using Marioni et al. method..")
