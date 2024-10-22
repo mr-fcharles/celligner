@@ -80,7 +80,7 @@ class Celligner(object):
         self.alpha = alpha
 
 
-    def __checkExpression(self, expression, is_reference):
+    def __checkExpression(self, expression, is_reference,compute_cPCs=True,target=False):
         """
         Checks gene overlap with reference, checks for NaNs, then does mean-centering.
 
@@ -109,7 +109,14 @@ class Celligner(object):
             raise ValueError("Expression dataframe contains NaNs")
 
         # Mean center the expression dataframe
-        expression = expression.sub(expression.mean(0), 1)
+        if compute_cPCs and target:
+            self.means = expression.mean(0)
+            expression = expression.sub(self.means, 1)
+        elif not compute_cPCs and target:
+            assert self.means is not None, "No means found, run transform with compute_cPCs=True at least once"
+            expression = expression.sub(self.means, 1)
+        elif compute_cPCs and not target:
+            expression = expression.sub(expression.mean(0), 1)
         
         return expression
 
@@ -244,7 +251,7 @@ class Celligner(object):
         """
         
         self.common_genes = list(ref_expr.columns)
-        self.ref_input = self.__checkExpression(ref_expr, is_reference=True)
+        self.ref_input = self.__checkExpression(ref_expr, is_reference=True,compute_cPCs=True,target=False)
         
         # Cluster and find differential expression for reference data
         self.ref_clusters = self.__cluster(self.ref_input)
@@ -323,7 +330,7 @@ class Celligner(object):
             
             if target_expr is not None:
                 
-                self.target_input = self.__checkExpression(target_expr, is_reference=False)
+                self.target_input = self.__checkExpression(target_expr, is_reference=False,compute_cPCs=True,target=True)
 
                 # Cluster and find differential expression for target data
                 self.target_clusters = self.__cluster(self.target_input)
@@ -363,20 +370,23 @@ class Celligner(object):
 
             print("Regressing top cPCs out of reference dataset..")
             transformed_ref = self.__regress_out_cpcs(self.ref_input, self.ref_pcs, self.cpca_loadings, regression_method)
+            self.ref_transformed = transformed_ref
 
             print("Regressing top cPCs out of target dataset..")
             transformed_target = self.__regress_out_cpcs(self.target_input, self.target_pcs, self.cpca_loadings, regression_method)
-            
+            self.target_transformed = transformed_target
 
         # Using previously computed cPCs - for multi-dataset alignment
         else:
-            
             # Allow some genes to be missing in new target dataset
             #TODO: implement a strategy to handle missing values
-            target_expr = self.__checkExpression(target_expr, is_reference=False)
+            target_expr = self.__checkExpression(target_expr, is_reference=False,compute_cPCs=False,target=True)
             transformed_target = self.__regress_out_cpcs(target_expr, self.target_pcs, self.cpca_loadings, regression_method)
-            transformed_ref = self.ref_input
-       
+            num_target_samples = transformed_target.shape[0]
+            #concatenate new targer with old target (this to facilitate the MNN step)
+            transformed_target = pd.concat([transformed_target,self.target_input])
+            #recover reference
+            transformed_ref = self.ref_transformed   
 
         # Do MNN 
         print("Doing the MNN analysis using Marioni et al. method..")
@@ -392,11 +402,10 @@ class Celligner(object):
 
         if compute_cPCs:
             self.combined_output =  pd.concat([target_corrected, transformed_ref])
-        else: # Append at the end for multi-dataset alignment case
-            self.combined_output =  pd.concat([transformed_ref, target_corrected])
-        
-        del target_corrected
-        gc.collect()
+        else:
+            #return only the new target samples
+            target_corrected = target_corrected.iloc[:num_target_samples]
+            return target_corrected
 
         print('Done')
 
