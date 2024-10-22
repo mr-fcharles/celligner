@@ -1,5 +1,6 @@
 from celligner.params import *
-from celligner import limma
+#from celligner import limma
+from celligner.fcomputer import FComputer
 
 from sklearn.decomposition import PCA, IncrementalPCA
 from sklearn.linear_model import LinearRegression
@@ -146,7 +147,7 @@ class Celligner(object):
         return fit_clusters
 
 
-    def __runDiffExprOnClusters(self, expression, clusters):
+    def __runDiffExprOnClusters(self, expression, clusters,n_jobs=1):
         """
         Runs limma (R) on the clustered data.
 
@@ -174,16 +175,28 @@ class Celligner(object):
         # creating the matrix
         data = expression.T
         data = data[data.columns[clusters != -1].tolist()]
+
+        de = FComputer(n_jobs=8)
+        #de.fit(data.values, design_matrix.values.astype(float),gene_names=data.index)
+        de.fit_sklearn(data.values, design_matrix.values.astype(float),gene_names=data.index)
+        de.eBayes()
+        de.Fstats()
+
+        res = pd.DataFrame()
+        res['F'] = de.F
+        res['index'] = data.index
+        #set index
+        res.set_index('index', inplace=True)
         
         # running limmapy
         print("Running limmapy..")
-        res = (
-            limma.limmapy()
-            .lmFit(data, design_matrix)
-            .eBayes(trend=False)
-            .topTable(number=len(data)) 
-            .iloc[:, len(clusts) :]
-        )
+        #res = (
+        #    limma.limmapy()
+        #    .lmFit(data, design_matrix)
+        #    .eBayes(trend=False)
+        #    .topTable(number=len(data)) 
+        #    .iloc[:, len(clusts) :]
+        #)
         return res.sort_values(by="F", ascending=False)
     
 
@@ -219,11 +232,15 @@ class Celligner(object):
         
         # Step 4: Compute the explained variance
         explained_variance = sorted_eigenvalues / torch.sum(sorted_eigenvalues)
+
+        # Step 5 project the target and reference data onto the cPCs
+        target_pcs = pd.DataFrame(centered_target_input.values @ sorted_eigenvectors.cpu().numpy(), index=centered_target_input.index, columns=["cPC" + str(i) for i in range(sorted_eigenvectors.shape[1])])
+        ref_pcs = pd.DataFrame(centered_ref_input.values @ sorted_eigenvectors.cpu().numpy(), index=centered_ref_input.index, columns=["cPC" + str(i) for i in range(sorted_eigenvectors.shape[1])])
         
-        return sorted_eigenvectors.cpu().numpy(), explained_variance.cpu().numpy()
+        return sorted_eigenvectors.cpu().numpy(), explained_variance.cpu().numpy(), target_pcs, ref_pcs
 
 
-    def fit(self, ref_expr):
+    def fit(self, ref_expr,n_jobs=1):
         """
         Fit the model to the reference expression dataset - cluster + find differentially expressed genes.
 
@@ -243,12 +260,12 @@ class Celligner(object):
         self.ref_clusters = self.__cluster(self.ref_input)
         if len(set(self.ref_clusters)) < 2:
             raise ValueError("Only one cluster found in reference data, no differential expression possible")
-        self.ref_de_genes = self.__runDiffExprOnClusters(self.ref_input, self.ref_clusters)
+        self.ref_de_genes = self.__runDiffExprOnClusters(self.ref_input, self.ref_clusters,n_jobs=n_jobs)
 
         return self
 
 
-    def transform(self, target_expr=None, compute_cPCs=True):
+    def transform(self, target_expr=None, compute_cPCs=True,regression_method="back_project"):
         """
         Align samples in the target dataset to samples in the reference dataset
 
@@ -315,19 +332,43 @@ class Celligner(object):
             
             # Compute contrastive PCs
             print("Running cPCA..")
-            self.cpca_loadings, self.cpca_explained_var = self.__runCPCA(centered_ref_input, centered_target_input)
+            self.cpca_loadings, self.cpca_explained_var, self.target_pcs, self.ref_pcs = self.__runCPCA(centered_ref_input, centered_target_input)
 
             del centered_ref_input, centered_target_input
             gc.collect()
 
             print("Regressing top cPCs out of reference dataset..")
-             # Take the residuals of the linear regression of ref_input with the cpca_loadings
-            transformed_ref = (self.ref_input - 
+            
+            if regression_method == "by_sample":
+                #sort self.ref_input by index
+                self.ref_input = self.ref_input.sort_index()
+                #sort self.target_pcs by index
+                self.ref_pcs = self.ref_pcs.sort_index()
+                # Take the residuals of the linear regression of ref_input with the cpca_loadings
+                transformed_ref = (self.ref_input - 
                 LinearRegression(fit_intercept=False)
-                    .fit(self.cpca_loadings.T, self.ref_input.T)
-                    .predict(self.cpca_loadings.T)
+                    .fit(self.ref_pcs, self.ref_input)
+                    .predict(self.ref_pcs)
                     .T
-            )
+                )
+            elif regression_method == "by_cPC": #should be equivalent to the previous version
+                # Take the residuals of the linear regression of ref_input with the cpca_loadings
+                transformed_ref = (self.ref_input.T - 
+                LinearRegression(fit_intercept=False)
+                    .fit(self.cpca_loadings, self.ref_input.T)
+                    .predict(self.cpca_loadings)
+                    #.T
+                ).T
+
+            elif regression_method == "back_project":
+                transformed_ref = pd.DataFrame(self.ref_input.values - (self.ref_input.values @ self.cpca_loadings @ self.cpca_loadings.T), 
+                                               index=self.ref_input.index, 
+                                               columns=self.ref_input.columns)
+
+            else:
+                raise ValueError("Invalid regression method")
+
+
 
         # Using previously computed cPCs - for multi-dataset alignment
         else:
@@ -358,12 +399,33 @@ class Celligner(object):
         
         # Only need to regress out of target dataset if using previously computed cPCs
         print("Regressing top cPCs out of target dataset..")
-        transformed_target = (self.target_input - 
-            LinearRegression(fit_intercept=False)
-                .fit(self.cpca_loadings.T, self.target_input.T)
-                .predict(self.cpca_loadings.T)
-                .T
-        )
+        if regression_method == "by_sample":
+            #sort self.target_input by index
+            self.target_input = self.target_input.sort_index()
+            #sort self.target_pcs by index
+            self.target_pcs = self.target_pcs.sort_index()
+            transformed_target = (self.target_input - 
+                LinearRegression(fit_intercept=False)
+                .fit(self.target_pcs, self.target_input)
+                .predict(self.target_pcs)
+                    .T
+                )
+            
+        elif regression_method == "by_cPC":
+            transformed_target = (self.target_input.T - 
+                LinearRegression(fit_intercept=False)
+                .fit(self.cpca_loadings, self.target_input.T)
+                .predict(self.cpca_loadings)
+                    #.T
+                ).T
+
+        elif regression_method == "back_project":
+            transformed_target = pd.DataFrame(self.target_input.values - (self.target_input.values @ self.cpca_loadings @ self.cpca_loadings.T), 
+                                               index=self.target_input.index, 
+                                               columns=self.target_input.columns)
+
+        else:
+            raise ValueError("Invalid regression method")
 
         # Do MNN 
         print("Doing the MNN analysis using Marioni et al. method..")
