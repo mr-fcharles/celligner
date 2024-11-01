@@ -27,6 +27,7 @@ class Celligner(object):
         self,
         topKGenes=TOP_K_GENES,
         pca_ncomp=PCA_NCOMP,
+        snn_n_neighbors=SNN_N_NEIGHBORS,
         cpca_ncomp=CPCA_NCOMP,
         louvain_kwargs=LOUVAIN_PARAMS,
         mnn_kwargs=MNN_PARAMS,
@@ -35,6 +36,7 @@ class Celligner(object):
         low_mem=False,
         device="cpu",
         alpha=1.0,
+        **kwargs
     ):
         """
         Initialize Celligner object
@@ -52,6 +54,7 @@ class Celligner(object):
         
         self.topKGenes = topKGenes
         self.pca_ncomp = pca_ncomp
+        self.snn_n_neighbors = snn_n_neighbors
         self.cpca_ncomp = cpca_ncomp
         self.louvain_kwargs = louvain_kwargs
         self.mnn_kwargs = mnn_kwargs
@@ -110,13 +113,14 @@ class Celligner(object):
 
         # Mean center the expression dataframe
         if compute_cPCs and target:
-            self.means = expression.mean(0)
-            expression = expression.sub(self.means, 1)
+            self.means_target = expression.mean(0)
+            expression = expression.sub(self.means_target, 1)
         elif not compute_cPCs and target:
-            assert self.means is not None, "No means found, run transform with compute_cPCs=True at least once"
-            expression = expression.sub(self.means, 1)
+            assert self.means_target is not None, "No means found, run transform with compute_cPCs=True at least once"
+            expression = expression.sub(self.means_target, 1)
         elif compute_cPCs and not target:
-            expression = expression.sub(expression.mean(0), 1)
+            self.means_ref = expression.mean(0)
+            expression = expression.sub(self.means_ref, 1)
         
         return expression
 

@@ -152,7 +152,10 @@ TISSUE_COLOR_R = {
 TOP_K_GENES = 1000
 
 # number of PCs to use for dimensionality reduction
-PCA_NCOMP = 70 
+PCA_NCOMP = 70
+
+# number of neighbors to use for SNN
+SNN_N_NEIGHBORS = 20
 
 # number of cPCA dimensions to regress out of the data
 CPCA_NCOMP = 4
