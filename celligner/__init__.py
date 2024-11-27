@@ -299,23 +299,20 @@ class Celligner(object):
             raise ValueError("Invalid regression method")
 
 
-    def transform(self, target_expr=None, compute_cPCs=True,regression_method="back_project"):
+    def transform(self, target_expr=None, compute_cPCs=True,transform_source="target",regression_method="back_project"):
         """
-        Align samples in the target dataset to samples in the reference dataset
+        Aligns samples in the target dataset to samples in the reference dataset.
 
         Args:
-            target_expr (pd.Dataframe, optional): target expression matrix of samples (rows) by genes (columns), 
-                where genes are ensembl gene IDs. Data should be log2(X+1) TPM data.
-                In the standard Celligner pipeline this the tumor data (TCGA). 
-                Set to None if re-running transform with new reference data.
-            compute_cPCs (bool, optional): if True, compute cPCs from the fitted reference and target expression. Defaults to True.
+            target_expr (pd.DataFrame, optional): The target expression matrix, where rows represent samples and columns represent genes identified by their Ensembl gene IDs. The data should be in log2(X+1) TPM format. In the standard Celligner pipeline, this corresponds to the tumor data (TCGA). Set to None if re-running transform with new reference data.
+            compute_cPCs (bool, optional): A flag indicating whether to compute contrastive principal components (cPCs) from the fitted reference and target expression. Defaults to True.
 
         Raises:
-            ValueError: if compute_cPCs is True but there is no reference input (fit has not been run)
-            ValueError: if compute_cPCs is False but there are no previously computed cPCs available (transform has not been previously run)
-            ValueError: if no target expression is provided and there is no previously provided target data
-            ValueError: if no target expression is provided and compute_cPCs is true; there is no use case for this
-            ValueError: if there are not enough clusters to compute DE genes for the target dataset
+            ValueError: Raised if compute_cPCs is True but there is no reference input (fit has not been run).
+            ValueError: Raised if compute_cPCs is False but there are no previously computed cPCs available (transform has not been previously run).
+            ValueError: Raised if no target expression is provided and there is no previously provided target data.
+            ValueError: Raised if no target expression is provided and compute_cPCs is true; there is no use case for this.
+            ValueError: Raised if there are not enough clusters to compute differentially expressed genes for the target dataset.
         """
 
         if self.ref_input is None and compute_cPCs:
@@ -329,6 +326,13 @@ class Celligner(object):
 
         if not compute_cPCs and target_expr is None:
             raise ValueError("No use case for running transform without new target data when compute_cPCs==True")
+        
+        if transform_source == 'target':
+            target = True
+        elif transform_source == 'reference':
+            target = False
+        else:
+            raise ValueError("Invalid transform source, must be 'target' or 'reference'")
 
         if compute_cPCs:
             
@@ -384,11 +388,21 @@ class Celligner(object):
         else:
             # Allow some genes to be missing in new target dataset
             #TODO: implement a strategy to handle missing values
-            target_expr = self.__checkExpression(target_expr, is_reference=False,compute_cPCs=False,target=True)
-            transformed_target = self.__regress_out_cpcs(target_expr, self.target_pcs, self.cpca_loadings, regression_method)
+            target_expr = self.__checkExpression(target_expr, is_reference=False,compute_cPCs=False,target=target)
+            
+            if target:
+                correct_pcs = self.target_pcs
+            else:
+                correct_pcs = self.ref_pcs
+
+            transformed_target = self.__regress_out_cpcs(target_expr, correct_pcs, self.cpca_loadings, regression_method)
             num_target_samples = transformed_target.shape[0]
             #concatenate new targer with old target (this to facilitate the MNN step)
-            transformed_target = pd.concat([transformed_target,self.target_input])
+
+            if target:
+                transformed_target = pd.concat([transformed_target,self.target_input])
+            else:
+                transformed_target = pd.concat([transformed_target,self.ref_input])
             #recover reference
             transformed_ref = self.ref_transformed   
 
