@@ -121,6 +121,9 @@ class Celligner(object):
         elif compute_cPCs and not target:
             self.means_ref = expression.mean(0)
             expression = expression.sub(self.means_ref, 1)
+        elif not compute_cPCs and not target:
+            assert self.means_ref is not None, "No means found, run transform with compute_cPCs=True at least once"
+            expression = expression.sub(self.means_ref, 1)
         
         return expression
 
